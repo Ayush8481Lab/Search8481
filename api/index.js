@@ -1,39 +1,46 @@
 export default async function handler(req, res) {
-    const { link } = req.query;
+    // query: search term
+    // type: 'all', 'artist', 'album'
+    const { query, type = 'all' } = req.query;
 
-    if (!link) {
-        return res.status(400).json({ error: "Please provide a link using ?link=..." });
+    if (!query) {
+        return res.status(400).json({ error: "Please provide ?query=YourSearchTerm" });
     }
 
-    // OPTIMIZATION 1: Enable Vercel Edge Caching
-    // s-maxage=86400: Cache on Vercel's servers for 24 hours (Super fast for repeat visits)
-    // stale-while-revalidate=43200: Serve old data instantly while updating in the background
-    res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=43200');
-
     try {
-        // OPTIMIZATION 2: Parallel Fetching if you need external data (not needed here yet, but good practice)
-        
-        // OPTIMIZATION 3: Jina Headers for Speed
-        const jinaUrl = `https://r.jina.ai/${link}`;
-        const jinaResponse = await fetch(jinaUrl, { 
-            headers: { 
-                'User-Agent': 'Mozilla/5.0',
-                'X-No-Cache': 'false',           // Allow Jina to use its own cache
-                'X-With-Generated-Alt': 'false', // Disable AI image captioning (Saves time)
-                'X-Respond-With': 'markdown'     // Force simple markdown (Less data to transfer)
-            } 
-        });
-        
-        if (!jinaResponse.ok) throw new Error("Jina Scrape Failed");
-        const text = await jinaResponse.text();
+        // 1. Construct Spotify URL
+        let targetUrl = `https://open.spotify.com/search/${encodeURIComponent(query)}`;
+        if (type === 'artist') targetUrl += '/artists';
+        if (type === 'album') targetUrl += '/albums';
 
-        // 2. Determine Mode & Parse
-        if (link.includes("/album/")) {
-            return parseAlbum(text, link, res);
-        } else if (link.includes("/artist/")) {
-            return parseArtist(text, link, res);
-        } else {
-            return res.status(400).json({ error: "Link must be a Spotify Album or Artist URL" });
+        // 2. Fetch Jina Text (With Auto-Retry 3 times)
+        const text = await fetchWithRetry(`https://r.jina.ai/${targetUrl}`);
+
+        // 3. Parse Data based on Type
+        if (type === 'artist') {
+            return res.status(200).json({
+                status: "success",
+                type: "artist_search",
+                results: parseArtists(text)
+            });
+        } 
+        else if (type === 'album') {
+            return res.status(200).json({
+                status: "success",
+                type: "album_search",
+                results: parseAlbums(text)
+            });
+        } 
+        else {
+            // GLOBAL SEARCH
+            // We parse everything from the text independently
+            return res.status(200).json({
+                status: "success",
+                type: "global_search",
+                songs: parseSongs(text),
+                artists: parseArtists(text),
+                albums: parseAlbums(text)
+            });
         }
 
     } catch (error) {
@@ -41,118 +48,107 @@ export default async function handler(req, res) {
     }
 }
 
-// --- LOGIC 1: ALBUM PARSER (Optimized Regex) ---
-function parseAlbum(text, sourceLink, res) {
-    // Extract Meta
-    const titleMatch = text.match(/Title: (.*?)(\n|$)/);
-    const rawTitle = titleMatch ? titleMatch[1] : "Unknown";
-    const cleanTitle = rawTitle.split(' - Album')[0].trim();
-    
-    const coverMatch = text.match(/!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)/);
-    const albumCover = coverMatch ? coverMatch[1] : "";
-
-    const yearMatch = text.match(/•(\d{4})•/);
-    const statsMatch = text.match(/(\d+ songs, .*?sec)/);
-    
-    // OPTIMIZATION 4: Single Pass Regex Loop
-    // Instead of splitting text multiple times, we run one efficient loop
-    const trackPattern = /^\d+\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[^)]+)\)(.*)/gm;
-    
-    const tracks = [];
-    let match;
-
-    while ((match = trackPattern.exec(text)) !== null) {
-        const rawArtists = match[3];
-        // Fast artist extraction
-        const artistNames = [...rawArtists.matchAll(/\[([^\]]+)\]/g)].map(m => m[1]).join(", ");
-
-        tracks.push({
-            title: match[1],
-            artist_names: artistNames,
-            spotify_url: match[2],
-            track_image: albumCover
-        });
+// --- HELPER: AUTO RETRY ---
+async function fetchWithRetry(url, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const res = await fetch(url, { 
+                headers: { 
+                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.121 Mobile Safari/537.36' 
+                } 
+            });
+            if (!res.ok) throw new Error(`Status ${res.status}`);
+            const text = await res.text();
+            if (text && text.length > 100) return text; // Ensure we got actual content
+        } catch (e) {
+            if (i === retries - 1) throw e;
+            await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+        }
     }
-
-    // Related Albums
-    const relatedAlbums = [];
-    // We only scan the bottom part of the text for related items to save processing
-    const moreBySection = text.split(/More by .*/)[1] || "";
-    const relatedPattern = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/album\/[^)]+)\)\s*\n\s*(\d{4})/g;
-    
-    let relMatch;
-    while ((relMatch = relatedPattern.exec(moreBySection)) !== null) {
-        relatedAlbums.push({
-            name: relMatch[2],
-            image: relMatch[1],
-            year: relMatch[4],
-            url: relMatch[3]
-        });
-    }
-
-    return res.status(200).json({
-        type: "album",
-        metadata: {
-            name: cleanTitle,
-            year: yearMatch ? yearMatch[1] : "Unknown",
-            stats: statsMatch ? statsMatch[1] : "",
-            cover_image: albumCover,
-            spotify_link: sourceLink
-        },
-        tracks: tracks,
-        related_albums: relatedAlbums
-    });
 }
 
-// --- LOGIC 2: ARTIST PARSER (Optimized) ---
-function parseArtist(text, sourceLink, res) {
-    const nameMatch = text.match(/Title: (.*?) \| Spotify/);
-    const listenerMatch = text.match(/([\d,]+) monthly listeners/);
+// --- PARSERS ---
+
+function parseSongs(text) {
+    // Regex looks for: Image -> Title -> /track/ Link -> Next Line (Artists)
+    // Matches: ![Image](url) \n [Title](.../track/...) \n Artists...
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[^)]+)\)(.*)/g;
     
-    // Efficient Image Finding
-    const mainImgMatch = text.match(/!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*.*?\n\s*=/);
-    const fallbackImg = text.match(/!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)/);
+    const results = [];
+    const seen = new Set();
+    let match;
     
-    // Top Songs
-    const popularSection = text.split("Popular")[1]?.split("Discography")[0] || "";
-    const topSongPattern = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[^)]+)\)/g;
-    
-    const topSongs = [];
-    let topMatch;
-    while ((topMatch = topSongPattern.exec(popularSection)) !== null) {
-        topSongs.push({
-            title: topMatch[2],
-            image: topMatch[1],
-            url: topMatch[3]
+    while ((match = regex.exec(text)) !== null) {
+        const id = match[3]; // Use URL as unique ID
+        if (seen.has(id)) continue;
+        seen.add(id);
+
+        // Clean up artists line
+        // It usually looks like: "[Artist](link), [Artist](link)" or just text
+        let rawArtists = match[4].trim();
+        // Remove links and brackets to get plain text
+        const cleanArtists = rawArtists
+            .replace(/\[([^\]]+)\]\(https:\/\/[^)]+\)/g, '$1') // Keep name, remove link
+            .replace(/\[|\]/g, '') // Remove leftover brackets
+            .trim();
+
+        results.push({
+            title: match[2],
+            banner: match[1],
+            artist_names: cleanArtists || "Unknown Artist",
+            track_link: match[3]
         });
     }
+    return results;
+}
 
-    // Discography (Albums/Singles)
-    let discographySection = text.split("Discography")[1] || "";
-    discographySection = discographySection.split(/Appears On|Fans also like|Artist Playlists|Discovered on/)[0];
+function parseArtists(text) {
+    // Regex looks for: Image -> Name -> /artist/ Link
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)/g;
 
-    const releasePattern = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/album\/[^)]+)\)\s*\n\s*(\d{4} • [A-Za-z]+|Latest Release • [A-Za-z]+)/g;
+    const results = [];
+    const seen = new Set();
+    let match;
 
-    const albums_and_singles = [];
-    let discMatch;
-    while ((discMatch = releasePattern.exec(discographySection)) !== null) {
-        albums_and_singles.push({
-            name: discMatch[2],
-            image: discMatch[1],
-            url: discMatch[3],
-            description: discMatch[4]
+    while ((match = regex.exec(text)) !== null) {
+        const id = match[3];
+        if (seen.has(id)) continue;
+        seen.add(id);
+
+        results.push({
+            name: match[2],
+            image: match[1],
+            artist_link: match[3]
         });
     }
+    return results;
+}
 
-    return res.status(200).json({
-        type: "artist",
-        metadata: {
-            name: nameMatch ? nameMatch[1] : "Unknown",
-            monthly_listeners: listenerMatch ? listenerMatch[1] : "Unknown",
-            image: mainImgMatch ? mainImgMatch[1] : (fallbackImg ? fallbackImg[1] : ""),
-            profile_url: sourceLink
-        },
-        top_songs: topSongs,
-        albums_and_singles: albums_and_singles
-    });
-        }
+function parseAlbums(text) {
+    // Regex looks for: Image -> Title -> /album/ Link -> Year
+    // It captures the description line which usually starts with Year (e.g., 2025 • Artist)
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/album\/[^)]+)\)\s*\n\s*(\d{4})?([^\n]*)/g;
+
+    const results = [];
+    const seen = new Set();
+    let match;
+
+    while ((match = regex.exec(text)) !== null) {
+        const id = match[3];
+        if (seen.has(id)) continue;
+        seen.add(id);
+
+        // Clean up description (remove links from artist names in description)
+        const rawDesc = match[5] || "";
+        const cleanDesc = rawDesc.replace(/\[([^\]]+)\]\(https:\/\/[^)]+\)/g, '$1').trim();
+
+        results.push({
+            title: match[2],
+            banner: match[1],
+            year: match[4] || "Unknown",
+            description: cleanDesc ? `${match[4] || ""} ${cleanDesc}` : (match[4] || ""),
+            album_link: match[3]
+        });
+    }
+    return results;
+                }
