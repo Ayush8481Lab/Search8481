@@ -6,35 +6,38 @@ export default async function handler(req, res) {
     }
 
     try {
-        // 1. Construct URL based on type
-        // We use the specific tabs to get cleaner data when possible
         let targetUrl = `https://open.spotify.com/search/${encodeURIComponent(query)}`;
+        
+        // Optimize: Only fetch the specific tab if requested
         if (type === 'artist') targetUrl += '/artists';
         if (type === 'album') targetUrl += '/albums';
 
-        // 2. Fetch Jina Text (Auto-Retry included)
+        // Fetch Data (Auto-Retry)
         const text = await fetchWithRetry(`https://r.jina.ai/${targetUrl}`);
 
-        // 3. Parse Based on Type
+        // --- PARSING LOGIC ---
+        
         if (type === 'artist') {
+            // Parse ONLY Artists from the Artist Tab
             return res.status(200).json({
                 status: "success",
-                type: "artist",
+                type: "artist_search",
                 results: parseArtists(text)
             });
         } 
         else if (type === 'album') {
+            // Parse ONLY Albums from the Album Tab
             return res.status(200).json({
                 status: "success",
-                type: "album",
+                type: "album_search",
                 results: parseAlbums(text)
             });
         } 
         else {
-            // GLOBAL SEARCH (All Categories)
+            // GLOBAL SEARCH (All from ONE request)
             return res.status(200).json({
                 status: "success",
-                type: "global",
+                type: "global_search",
                 songs: parseSongs(text),
                 artists: parseArtists(text),
                 albums: parseAlbums(text)
@@ -56,28 +59,31 @@ async function fetchWithRetry(url, retries = 3) {
             if (text.length > 100) return text;
         } catch (e) {
             if (i === retries - 1) throw e;
-            await new Promise(r => setTimeout(r, 800)); // Wait before retry
+            await new Promise(r => setTimeout(r, 800));
         }
     }
+    return "";
 }
 
-// --- HELPER: CLEAN MARKDOWN ---
-function cleanMarkdownLinks(str) {
+// --- HELPER: CLEAN TEXT ---
+function cleanText(str) {
     if (!str) return "";
-    // Replaces "[Name](Link)" with "Name"
-    // Replaces "[Name]" with "Name"
     return str
-        .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1') // Remove link, keep text
-        .replace(/\[([^\]]+)\]/g, '$1') // Remove brackets
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1') // Remove markdown links
+        .replace(/\[|\]/g, '') // Remove brackets
+        .replace(/"/g, '') // Remove quotes
         .trim();
 }
 
 // --- PARSERS ---
 
 function parseSongs(text) {
-    // Looks for: Image -> Title(TrackLink) -> (Optional Newline) -> Artist Line
-    // The artist line often contains commas: "Artist 1, Artist 2"
-    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[^)]+)\)\s*\n?([^\n]+)/g;
+    // Regex matches:
+    // 1. Image
+    // 2. Title
+    // 3. CLEAN URL (Stops before space or quote)
+    // 4. Artist Line (Next line)
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[a-zA-Z0-9]+)[^)]*\)\s*\n\s*([^\n]+)/g;
     
     const results = [];
     const seen = new Set();
@@ -88,25 +94,23 @@ function parseSongs(text) {
         if (seen.has(id)) continue;
         seen.add(id);
 
-        // Group 1: Image
-        // Group 2: Title
-        // Group 3: Link
-        // Group 4: Raw Artist Line (e.g. "[Artist](url), [Artist](url)")
-
         results.push({
             title: match[2].trim(),
-            image: match[1],
-            artist: cleanMarkdownLinks(match[4]), // Clean the artist line
-            url: match[3]
+            banner: match[1],
+            artist_names: cleanText(match[4]), // Removes links from artist names
+            track_link: match[3] // Clean URL
         });
     }
     return results;
 }
 
 function parseArtists(text) {
-    // Looks for: Image -> Name(ArtistLink) -> "Artist"
-    // "Artist" literal helps filter out songs/albums that might look similar
-    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)\s*\n\s*Artist/g;
+    // Regex matches:
+    // 1. Image
+    // 2. Name
+    // 3. CLEAN URL (Stops before space or quote)
+    // 4. "Artist" literal (to ensure it's an artist)
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[a-zA-Z0-9]+)[^)]*\)\s*\n\s*Artist/g;
 
     const results = [];
     const seen = new Set();
@@ -120,16 +124,19 @@ function parseArtists(text) {
         results.push({
             name: match[2].trim(),
             image: match[1],
-            url: match[3]
+            artist_link: match[3] // Clean URL
         });
     }
     return results;
 }
 
 function parseAlbums(text) {
-    // Looks for: Image -> Title(AlbumLink) -> Year • Artist
-    // The description usually starts with Year (4 digits)
-    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/album\/[^)]+)\)\s*\n\s*(\d{4}[^\n]*)/g;
+    // Regex matches:
+    // 1. Image
+    // 2. Title
+    // 3. CLEAN URL
+    // 4. Description line (Year • Artist)
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/album\/[a-zA-Z0-9]+)[^)]*\)\s*\n\s*([^\n]+)/g;
 
     const results = [];
     const seen = new Set();
@@ -140,28 +147,22 @@ function parseAlbums(text) {
         if (seen.has(id)) continue;
         seen.add(id);
 
-        const rawDesc = match[4]; // e.g. "2024 • Artist Name"
+        const rawDesc = match[4].trim();
         
-        // Split Year and Artist if possible
-        let year = "Unknown";
-        let artist = "";
-        
-        if (rawDesc.includes('•')) {
-            const parts = rawDesc.split('•');
-            year = parts[0].trim();
-            artist = cleanMarkdownLinks(parts.slice(1).join('•'));
-        } else {
-            year = rawDesc.substring(0, 4); // Guess first 4 chars are year
-            artist = cleanMarkdownLinks(rawDesc.substring(4));
-        }
+        // Filter out Playlists masquerading as albums
+        if (rawDesc.includes("Playlist") || rawDesc.includes("Spotify")) continue;
+
+        // Extract Year (first 4 digits)
+        const yearMatch = rawDesc.match(/\d{4}/);
+        const year = yearMatch ? yearMatch[0] : "Unknown";
 
         results.push({
             title: match[2].trim(),
-            image: match[1],
+            banner: match[1],
             year: year,
-            artist: artist,
-            url: match[3]
+            description: cleanText(rawDesc), // Full description (2024 • Artist)
+            album_link: match[3] // Clean URL
         });
     }
     return results;
-                }
+}
