@@ -1,6 +1,4 @@
 export default async function handler(req, res) {
-    // query: search term
-    // type: 'all', 'artist', 'album'
     const { query, type = 'all' } = req.query;
 
     if (!query) {
@@ -8,35 +6,35 @@ export default async function handler(req, res) {
     }
 
     try {
-        // 1. Construct Spotify URL
+        // 1. Construct URL based on type
+        // We use the specific tabs to get cleaner data when possible
         let targetUrl = `https://open.spotify.com/search/${encodeURIComponent(query)}`;
         if (type === 'artist') targetUrl += '/artists';
         if (type === 'album') targetUrl += '/albums';
 
-        // 2. Fetch Jina Text (With Auto-Retry 3 times)
+        // 2. Fetch Jina Text (Auto-Retry included)
         const text = await fetchWithRetry(`https://r.jina.ai/${targetUrl}`);
 
-        // 3. Parse Data based on Type
+        // 3. Parse Based on Type
         if (type === 'artist') {
             return res.status(200).json({
                 status: "success",
-                type: "artist_search",
+                type: "artist",
                 results: parseArtists(text)
             });
         } 
         else if (type === 'album') {
             return res.status(200).json({
                 status: "success",
-                type: "album_search",
+                type: "album",
                 results: parseAlbums(text)
             });
         } 
         else {
-            // GLOBAL SEARCH
-            // We parse everything from the text independently
+            // GLOBAL SEARCH (All Categories)
             return res.status(200).json({
                 status: "success",
-                type: "global_search",
+                type: "global",
                 songs: parseSongs(text),
                 artists: parseArtists(text),
                 albums: parseAlbums(text)
@@ -52,59 +50,63 @@ export default async function handler(req, res) {
 async function fetchWithRetry(url, retries = 3) {
     for (let i = 0; i < retries; i++) {
         try {
-            const res = await fetch(url, { 
-                headers: { 
-                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.121 Mobile Safari/537.36' 
-                } 
-            });
+            const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
             if (!res.ok) throw new Error(`Status ${res.status}`);
             const text = await res.text();
-            if (text && text.length > 100) return text; // Ensure we got actual content
+            if (text.length > 100) return text;
         } catch (e) {
             if (i === retries - 1) throw e;
-            await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+            await new Promise(r => setTimeout(r, 800)); // Wait before retry
         }
     }
+}
+
+// --- HELPER: CLEAN MARKDOWN ---
+function cleanMarkdownLinks(str) {
+    if (!str) return "";
+    // Replaces "[Name](Link)" with "Name"
+    // Replaces "[Name]" with "Name"
+    return str
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1') // Remove link, keep text
+        .replace(/\[([^\]]+)\]/g, '$1') // Remove brackets
+        .trim();
 }
 
 // --- PARSERS ---
 
 function parseSongs(text) {
-    // Regex looks for: Image -> Title -> /track/ Link -> Next Line (Artists)
-    // Matches: ![Image](url) \n [Title](.../track/...) \n Artists...
-    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[^)]+)\)(.*)/g;
+    // Looks for: Image -> Title(TrackLink) -> (Optional Newline) -> Artist Line
+    // The artist line often contains commas: "Artist 1, Artist 2"
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[^)]+)\)\s*\n?([^\n]+)/g;
     
     const results = [];
     const seen = new Set();
     let match;
-    
+
     while ((match = regex.exec(text)) !== null) {
-        const id = match[3]; // Use URL as unique ID
+        const id = match[3];
         if (seen.has(id)) continue;
         seen.add(id);
 
-        // Clean up artists line
-        // It usually looks like: "[Artist](link), [Artist](link)" or just text
-        let rawArtists = match[4].trim();
-        // Remove links and brackets to get plain text
-        const cleanArtists = rawArtists
-            .replace(/\[([^\]]+)\]\(https:\/\/[^)]+\)/g, '$1') // Keep name, remove link
-            .replace(/\[|\]/g, '') // Remove leftover brackets
-            .trim();
+        // Group 1: Image
+        // Group 2: Title
+        // Group 3: Link
+        // Group 4: Raw Artist Line (e.g. "[Artist](url), [Artist](url)")
 
         results.push({
-            title: match[2],
-            banner: match[1],
-            artist_names: cleanArtists || "Unknown Artist",
-            track_link: match[3]
+            title: match[2].trim(),
+            image: match[1],
+            artist: cleanMarkdownLinks(match[4]), // Clean the artist line
+            url: match[3]
         });
     }
     return results;
 }
 
 function parseArtists(text) {
-    // Regex looks for: Image -> Name -> /artist/ Link
-    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)/g;
+    // Looks for: Image -> Name(ArtistLink) -> "Artist"
+    // "Artist" literal helps filter out songs/albums that might look similar
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)\s*\n\s*Artist/g;
 
     const results = [];
     const seen = new Set();
@@ -116,18 +118,18 @@ function parseArtists(text) {
         seen.add(id);
 
         results.push({
-            name: match[2],
+            name: match[2].trim(),
             image: match[1],
-            artist_link: match[3]
+            url: match[3]
         });
     }
     return results;
 }
 
 function parseAlbums(text) {
-    // Regex looks for: Image -> Title -> /album/ Link -> Year
-    // It captures the description line which usually starts with Year (e.g., 2025 • Artist)
-    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/album\/[^)]+)\)\s*\n\s*(\d{4})?([^\n]*)/g;
+    // Looks for: Image -> Title(AlbumLink) -> Year • Artist
+    // The description usually starts with Year (4 digits)
+    const regex = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/album\/[^)]+)\)\s*\n\s*(\d{4}[^\n]*)/g;
 
     const results = [];
     const seen = new Set();
@@ -138,16 +140,27 @@ function parseAlbums(text) {
         if (seen.has(id)) continue;
         seen.add(id);
 
-        // Clean up description (remove links from artist names in description)
-        const rawDesc = match[5] || "";
-        const cleanDesc = rawDesc.replace(/\[([^\]]+)\]\(https:\/\/[^)]+\)/g, '$1').trim();
+        const rawDesc = match[4]; // e.g. "2024 • Artist Name"
+        
+        // Split Year and Artist if possible
+        let year = "Unknown";
+        let artist = "";
+        
+        if (rawDesc.includes('•')) {
+            const parts = rawDesc.split('•');
+            year = parts[0].trim();
+            artist = cleanMarkdownLinks(parts.slice(1).join('•'));
+        } else {
+            year = rawDesc.substring(0, 4); // Guess first 4 chars are year
+            artist = cleanMarkdownLinks(rawDesc.substring(4));
+        }
 
         results.push({
-            title: match[2],
-            banner: match[1],
-            year: match[4] || "Unknown",
-            description: cleanDesc ? `${match[4] || ""} ${cleanDesc}` : (match[4] || ""),
-            album_link: match[3]
+            title: match[2].trim(),
+            image: match[1],
+            year: year,
+            artist: artist,
+            url: match[3]
         });
     }
     return results;
